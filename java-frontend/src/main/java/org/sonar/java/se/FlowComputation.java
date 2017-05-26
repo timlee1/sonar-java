@@ -35,6 +35,7 @@ import org.sonar.java.se.ExplodedGraph.Node;
 import org.sonar.java.se.checks.SyntaxTreeNameFinder;
 import org.sonar.java.se.constraint.Constraint;
 import org.sonar.java.se.constraint.ObjectConstraint;
+import org.sonar.java.se.symbolicvalues.RelationalSymbolicValue;
 import org.sonar.java.se.symbolicvalues.BinarySymbolicValue;
 import org.sonar.java.se.symbolicvalues.SymbolicValue;
 import org.sonar.java.se.xproc.HappyPathYield;
@@ -78,6 +79,7 @@ public class FlowComputation {
   private static final String IMPLIES_IS_MSG = "Implies '%s' is %s.";
   private static final String IMPLIES_CAN_BE_MSG = "Implies '%s' can be %s.";
   private static final String IMPLIES_SAME_VALUE = "Implies '%s' has the same value as '%s'.";
+  private static final String IMPLIES_NOT_SAME_VALUE = "Implies '%s' doesn't have the same value as '%s'.";
 
   private static final int MAX_FLOW_STEPS = 3_000_000;
   private static final Logger LOG = Loggers.get(ExplodedGraphWalker.class);
@@ -95,7 +97,7 @@ public class FlowComputation {
   }
 
   private static Set<SymbolicValue> computedFrom(@Nullable SymbolicValue symbolicValue) {
-    if (symbolicValue == null) {
+    if (symbolicValue == null || isLiteralSymbolicValue(symbolicValue)) {
       return Collections.emptySet();
     }
     Set<SymbolicValue> result = new HashSet<>();
@@ -156,7 +158,7 @@ public class FlowComputation {
     Set<List<JavaFileScannerContext.Location>> flows = new HashSet<>();
     Deque<ExecutionPath> workList = new ArrayDeque<>();
     SameConstraints sameConstraints = new SameConstraints(node, trackedSymbols, domains);
-    node.edges().stream().flatMap(e -> startPath(e, trackedSymbols, sameConstraints)).forEach(workList::push);
+    node.edges().stream().flatMap(e -> startPath(e, trackedSymbols, sameConstraints, symbolicValues)).forEach(workList::push);
     int flowSteps = 0;
     Set<ExecutionPath> visited = new HashSet<>(workList);
     while (!workList.isEmpty()) {
@@ -182,8 +184,12 @@ public class FlowComputation {
     return flows;
   }
 
-  Stream<ExecutionPath> startPath(ExplodedGraph.Edge edge, PSet<Symbol> trackedSymbols, SameConstraints sameConstraints) {
-    return new ExecutionPath(null, PCollections.emptySet(), trackedSymbols, sameConstraints, ImmutableList.of(), false).addEdge(edge);
+  Stream<ExecutionPath> startPath(ExplodedGraph.Edge edge, PSet<Symbol> trackedSymbols, SameConstraints sameConstraints, Set<SymbolicValue> symbolicValues) {
+    PSet<SymbolicValue> trackedSymbolicValues = PCollections.emptySet();
+    for (SymbolicValue symbolicValue : symbolicValues) {
+      trackedSymbolicValues = trackedSymbolicValues.add(symbolicValue);
+    }
+    return new ExecutionPath(null, PCollections.emptySet(), trackedSymbols, sameConstraints, trackedSymbolicValues, ImmutableList.of(), false).addEdge(edge);
   }
 
   private static class SameConstraints {
@@ -254,15 +260,19 @@ public class FlowComputation {
     final PSet<ExplodedGraph.Edge> visited;
     final List<JavaFileScannerContext.Location> flow;
     final boolean finished;
+    final PSet<SymbolicValue> trackedSymbolicValues;
+    PSet<Symbol> newTrackedSymbols;
+    PSet<SymbolicValue> newTrackedSymbolicValues;
 
     private ExecutionPath(@Nullable ExplodedGraph.Edge edge, PSet<ExplodedGraph.Edge> visited, PSet<Symbol> trackedSymbols, SameConstraints sameConstraints,
-                          List<JavaFileScannerContext.Location> flow, boolean finished) {
+                          PSet<SymbolicValue> trackedSymbolicValues, List<JavaFileScannerContext.Location> flow, boolean finished) {
       this.trackedSymbols = trackedSymbols;
       this.sameConstraints = sameConstraints;
       this.lastEdge = edge;
       this.visited = visited;
       this.flow = flow;
       this.finished = finished;
+      this.trackedSymbolicValues = trackedSymbolicValues;
     }
 
     @Override
@@ -285,6 +295,8 @@ public class FlowComputation {
     }
 
     Stream<ExecutionPath> addEdge(ExplodedGraph.Edge edge) {
+      newTrackedSymbols = trackedSymbols;
+      newTrackedSymbolicValues = trackedSymbolicValues;
       ImmutableList.Builder<JavaFileScannerContext.Location> flowBuilder = ImmutableList.builder();
       flowBuilder.addAll(flow);
 
@@ -293,11 +305,10 @@ public class FlowComputation {
         .orElse(ImmutableList.of());
       flowBuilder.addAll(laFlow);
 
-      PSet<Symbol> newTrackSymbols = newTrackedSymbols(edge);
-      SameConstraints newSameConstraints = newTrackSymbols == trackedSymbols ? sameConstraints : new SameConstraints(sameConstraints, newTrackSymbols);
+      newTrackedSymbols = newTrackedSymbols(edge);
+      SameConstraints newSameConstraints = newTrackedSymbols == trackedSymbols ? sameConstraints : new SameConstraints(sameConstraints, newTrackedSymbols);
 
-      Set<LearnedConstraint> learnedConstraints = learnedConstraints(edge);
-      List<JavaFileScannerContext.Location> lcFlow = flowFromLearnedConstraints(edge, filterRedundantObjectDomain(learnedConstraints));
+      List<JavaFileScannerContext.Location> lcFlow = flowFromLearnedConstraints(edge);
       flowBuilder.addAll(lcFlow);
 
       boolean endOfPath = visitedAllParents(edge) || shouldTerminate(edge.learnedConstraints());
@@ -310,7 +321,7 @@ public class FlowComputation {
       Set<List<JavaFileScannerContext.Location>> yieldsFlows = flowFromYields(edge);
       return yieldsFlows.stream()
         .map(yieldFlow -> ImmutableList.<JavaFileScannerContext.Location>builder().addAll(currentFlow).addAll(yieldFlow).build())
-        .map(f -> new ExecutionPath(edge, visited.add(edge), newTrackSymbols, newSameConstraints, f, endOfPath));
+        .map(f -> new ExecutionPath(edge, visited.add(edge), newTrackedSymbols, newSameConstraints, newTrackedSymbolicValues, f, endOfPath));
     }
 
     private Set<LearnedConstraint> filterRedundantObjectDomain(Set<LearnedConstraint> learnedConstraints) {
@@ -353,17 +364,62 @@ public class FlowComputation {
       return owner.isMethodSymbol() && ((Symbol.MethodSymbol) owner).declaration().parameters().contains(symbol.declaration());
     }
 
-    private List<JavaFileScannerContext.Location> flowFromLearnedConstraints(ExplodedGraph.Edge edge, Set<LearnedConstraint> learnedConstraints) {
-      // FIXME SONARJAVA-2303 calling distinct is temporary workaround to avoid duplicated messages when constraint is reported on relational SV and also on its operand
-      return learnedConstraints.stream()
+    private List<JavaFileScannerContext.Location> flowFromLearnedConstraints(ExplodedGraph.Edge edge) {
+      ArrayList<JavaFileScannerContext.Location> result = new ArrayList<>();
+      Set<LearnedConstraint> allLearnedConstraints = edge.learnedConstraints();
+      Set<SymbolicValue> reported = new HashSet<>();
+      for (LearnedConstraint learnedConstraint : allLearnedConstraints) {
+        if (learnedConstraint.symbolicValue() instanceof RelationalSymbolicValue) {
+          RelationalSymbolicValue relation = (RelationalSymbolicValue) learnedConstraint.symbolicValue();
+          if (shouldReportRelation(relation)) {
+            Symbol first = trackedSymbols.contains(relation.leftSymbol()) ? relation.leftSymbol() : relation.rightSymbol();
+            Symbol other = relation.leftSymbol() == first ? relation.rightSymbol() : relation.leftSymbol();
+            String msg = String.format(relation.isEquality() ? IMPLIES_SAME_VALUE : IMPLIES_NOT_SAME_VALUE, first.name(), other.name());
+            result.add(location(edge.parent, msg));
+            reported.add(relation);
+            reported.addAll(relation.computedFrom());
+          }
+          if (newTrackedSymbolicValues.contains(relation.getLeftOp()) && !isLiteralSymbolicValue(relation.getRightOp())) {
+            newTrackedSymbolicValues = newTrackedSymbolicValues.add(relation.getRightOp());
+          }
+          if (newTrackedSymbolicValues.contains(relation.getRightOp()) && !isLiteralSymbolicValue(relation.getLeftOp())) {
+            newTrackedSymbolicValues = newTrackedSymbolicValues.add(relation.getLeftOp());
+          }
+          if (relation.leftSymbol() != null && newTrackedSymbols.contains(relation.leftSymbol()) && relation.rightSymbol() != null) {
+            newTrackedSymbols = newTrackedSymbols.add(relation.rightSymbol());
+          }
+          if (relation.rightSymbol() != null && newTrackedSymbols.contains(relation.rightSymbol()) && relation.leftSymbol() != null) {
+            newTrackedSymbols = newTrackedSymbols.add(relation.leftSymbol());
+          }
+        }
+      }
+      Set<LearnedConstraint> learnedConstraints = filterRedundantObjectDomain(learnedConstraints(edge));
+      learnedConstraints.stream()
+        .filter(lc -> !reported.contains(lc.symbolicValue()))
         .map(lc -> learnedConstraintFlow(lc, edge))
         .flatMap(List::stream)
-        .distinct()
-        .collect(Collectors.toList());
+        .forEach(result::add);
+      return result;
+    }
+
+    private boolean shouldReportRelation(RelationalSymbolicValue relation) {
+      if (!relation.isEquality() && !relation.isInequality()) {
+        return false;
+      }
+      Symbol leftSymbol = relation.leftSymbol();
+      Symbol rightSymbol = relation.rightSymbol();
+      if (leftSymbol == null || rightSymbol == null) {
+        return false;
+      }
+      if (trackedSymbols.contains(leftSymbol) || trackedSymbols.contains(rightSymbol)
+        || trackedSymbolicValues.contains(relation.getLeftOp()) || trackedSymbolicValues.contains(relation.getRightOp())) {
+        return true;
+      }
+      return false;
     }
 
     private boolean shouldTerminate(Set<LearnedConstraint> learnedConstraints) {
-      return learnedConstraints.stream().filter(lc -> symbolicValues.contains(lc.symbolicValue())).map(LearnedConstraint::constraint).anyMatch(terminateTraversal);
+      return learnedConstraints.stream().filter(lc -> trackedSymbolicValues.contains(lc.symbolicValue())).map(LearnedConstraint::constraint).anyMatch(terminateTraversal);
     }
 
     Optional<LearnedAssociation> learnedAssociation(ExplodedGraph.Edge edge) {
@@ -463,17 +519,17 @@ public class FlowComputation {
     private PSet<Symbol> newTrackedSymbols(ExplodedGraph.Edge edge) {
       Optional<LearnedAssociation> learnedAssociation = learnedAssociation(edge);
       return learnedAssociation.map(la -> {
-        PSet<Symbol> newTrackedSymbols = trackedSymbols.remove(la.symbol);
+        PSet<Symbol> result = trackedSymbols.remove(la.symbol);
         ProgramState programState = edge.parent.programState;
         Symbol symbol = symbolFromStack(la.symbolicValue(), programState);
         if (symbol != null) {
-          newTrackedSymbols = newTrackedSymbols.add(symbol);
+          result = result.add(symbol);
         } else {
           for (Symbol s : la.symbolicValue().computedFromSymbols()) {
-            newTrackedSymbols = newTrackedSymbols.add(s);
+            result = result.add(s);
           }
         }
-        return newTrackedSymbols;
+        return result;
       }).orElse(trackedSymbols);
     }
 
@@ -499,7 +555,7 @@ public class FlowComputation {
       // guarantee that we will keep the same domain order when reporting
       for (Class<? extends Constraint> domain : domains) {
         learnedConstraints.stream()
-          .filter(lc -> symbolicValues.contains(lc.symbolicValue()) && hasConstraintForDomain(lc, domain))
+          .filter(lc -> trackedSymbolicValues.contains(lc.symbolicValue()) && hasConstraintForDomain(lc, domain))
           .forEach(lcByDomainBuilder::add);
       }
 
@@ -592,16 +648,16 @@ public class FlowComputation {
       MethodInvocationTree mit = (MethodInvocationTree) parent.programPoint.syntaxTree();
       ImmutableList.Builder<JavaFileScannerContext.Location> flowBuilder = ImmutableList.builder();
       SymbolicValue returnSV = edge.child.programState.peekValue();
-      if (symbolicValues.contains(returnSV)) {
+      if (returnSV != null && trackedSymbolicValues.contains(returnSV)) {
         flowBuilder.add(methodInvocationReturnMessage(learnedConstraint, edge, mit.symbol().name()));
       }
       SymbolicValue invocationTarget = parent.programState.peekValue(mit.arguments().size());
-      if (symbolicValues.contains(invocationTarget)) {
+      if (invocationTarget != null && trackedSymbolicValues.contains(invocationTarget)) {
         String invocationTargetName = SyntaxTreeNameFinder.getName(mit.methodSelect());
         flowBuilder.add(location(parent, String.format(IMPLIES_IS_MSG, invocationTargetName, learnedConstraint.valueAsString())));
       }
 
-      List<Integer> argumentIndices = correspondingArgumentIndices(symbolicValues, parent);
+      List<Integer> argumentIndices = correspondingArgumentIndices(trackedSymbolicValues, parent);
       argumentIndices.stream()
         .map(mit.arguments()::get)
         .map(argTree -> {
@@ -643,7 +699,7 @@ public class FlowComputation {
         return ImmutableSet.of(ImmutableList.of());
       }
 
-      List<Integer> argumentIndices = correspondingArgumentIndices(symbolicValues, edge.parent);
+      List<Integer> argumentIndices = correspondingArgumentIndices(trackedSymbolicValues, edge.parent);
 
       MethodInvocationTree mit = (MethodInvocationTree) edge.parent.programPoint.syntaxTree();
       // computes flow messages for arguments being passed to the called method
@@ -652,7 +708,7 @@ public class FlowComputation {
       List<JavaFileScannerContext.Location> changingNameArgumentsMessages = flowsForArgumentsChangingName(argumentIndices, mit);
 
       SymbolicValue returnSV = edge.child.programState.peekValue();
-      if (symbolicValues.contains(returnSV)) {
+      if (returnSV != null && trackedSymbolicValues.contains(returnSV)) {
         // to retrieve flow for return value
         argumentIndices.add(-1);
       }
@@ -681,7 +737,7 @@ public class FlowComputation {
       return false;
     }
 
-    private List<Integer> correspondingArgumentIndices(Set<SymbolicValue> candidates, ExplodedGraph.Node invocationNode) {
+    private List<Integer> correspondingArgumentIndices(PSet<SymbolicValue> candidates, ExplodedGraph.Node invocationNode) {
       MethodInvocationTree mit = (MethodInvocationTree) invocationNode.programPoint.syntaxTree();
       List<SymbolicValue> arguments = argumentsUsedForMethodInvocation(invocationNode, mit);
       return IntStream.range(0, arguments.size())
@@ -750,5 +806,9 @@ public class FlowComputation {
       default:
         return null;
     }
+  }
+
+  private static boolean isLiteralSymbolicValue(SymbolicValue symbolicValue) {
+    return SymbolicValue.PROTECTED_SYMBOLIC_VALUES.contains(symbolicValue);
   }
 }

@@ -50,15 +50,14 @@ class A {
   }
 
   void npe1(Object a) {
-    Object b = null;
-    if (a == b) { // flow@npe1 {{Implies 'a' is null.}}
+    Object b = null; // flow@npe1 {{Implies 'b' is null.}}
+    if (a == b) { // flow@npe1 {{Implies 'a' has the same value as 'b'.}}
       a.toString(); // Noncompliant [[flows=npe1]] flow@npe1 {{'a' is dereferenced.}}
     }
   }
 
   void npe2(Object a, Object b) {
-    if (a == b) {
-      // FIXME SONARJAVA-2272
+    if (a == b) { // flow@npe2 {{Implies 'a' has the same value as 'b'.}}
       if (b == null) { // flow@npe2 {{Implies 'b' can be null.}}
         a.toString(); // Noncompliant [[flows=npe2]] flow@npe2 {{'a' is dereferenced.}}
       }

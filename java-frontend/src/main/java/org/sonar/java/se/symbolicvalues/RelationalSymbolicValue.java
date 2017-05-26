@@ -22,6 +22,7 @@ package org.sonar.java.se.symbolicvalues;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+
 import org.sonar.java.collections.PMap;
 import org.sonar.java.se.ProgramState;
 import org.sonar.java.se.constraint.BooleanConstraint;
@@ -136,7 +137,10 @@ public class RelationalSymbolicValue extends BinarySymbolicValue {
   }
 
   RelationalSymbolicValue inverse() {
-    return new RelationalSymbolicValue(kind.inverse(), leftOp, rightOp);
+    RelationalSymbolicValue inverted = new RelationalSymbolicValue(kind.inverse(), leftOp, rightOp);
+    inverted.leftSymbol = leftSymbol;
+    inverted.rightSymbol = rightSymbol;
+    return inverted;
   }
 
   private List<ProgramState> copyAllConstraints(ProgramState programState) {
@@ -433,6 +437,11 @@ public class RelationalSymbolicValue extends BinarySymbolicValue {
   public boolean isEquality() {
     return kind == Kind.EQUAL || kind == Kind.METHOD_EQUALS;
   }
+
+  public boolean isInequality() {
+    return kind == Kind.NOT_EQUAL || kind == Kind.NOT_METHOD_EQUALS;
+  }
+
 
   @Override
   public int hashCode() {
